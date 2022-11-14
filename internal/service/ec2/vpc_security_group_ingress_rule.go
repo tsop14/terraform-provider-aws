@@ -30,7 +30,12 @@ func init() {
 
 // newResourceSecurityGroupIngressRule instantiates a new Resource for the aws_vpc_security_group_ingress_rule resource.
 func newResourceSecurityGroupIngressRule(context.Context) (resource.ResourceWithConfigure, error) {
-	return &resourceSecurityGroupIngressRule{}, nil
+	r := &resourceSecurityGroupIngressRule{}
+	r.create = r.createSecurityGroupRule
+	r.delete = r.deleteSecurityGroupRule
+	r.findByID = r.findSecurityGroupRuleByID
+
+	return r, nil
 }
 
 type resourceSecurityGroupIngressRule struct {
@@ -41,27 +46,6 @@ type resourceSecurityGroupIngressRule struct {
 // examplecloud_thing.
 func (r *resourceSecurityGroupIngressRule) Metadata(_ context.Context, request resource.MetadataRequest, response *resource.MetadataResponse) {
 	response.TypeName = "aws_vpc_security_group_ingress_rule"
-}
-
-// Create is called when the provider must create a new resource.
-// Config and planned state values should be read from the CreateRequest and new state values set on the CreateResponse.
-func (r *resourceSecurityGroupIngressRule) Create(ctx context.Context, request resource.CreateRequest, response *resource.CreateResponse) {
-	r.create(ctx, request, response, r.createSecurityGroupRule)
-}
-
-// Read is called when the provider must read resource values in order to update state.
-// Planned state values should be read from the ReadRequest and new state values set on the ReadResponse.
-func (r *resourceSecurityGroupIngressRule) Read(ctx context.Context, request resource.ReadRequest, response *resource.ReadResponse) {
-	r.read(ctx, request, response, r.findSecurityGroupRuleByID)
-}
-
-// Delete is called when the provider must delete the resource.
-// Config values may be read from the DeleteRequest.
-//
-// If execution completes without error, the framework will automatically call DeleteResponse.State.RemoveResource(),
-// so it can be omitted from provider logic.
-func (r *resourceSecurityGroupIngressRule) Delete(ctx context.Context, request resource.DeleteRequest, response *resource.DeleteResponse) {
-	r.delete(ctx, request, response, r.deleteSecurityGroupRule)
 }
 
 func (r *resourceSecurityGroupIngressRule) createSecurityGroupRule(ctx context.Context, data *resourceSecurityGroupRuleData) (string, error) {
@@ -102,6 +86,10 @@ func (r *resourceSecurityGroupIngressRule) findSecurityGroupRuleByID(ctx context
 
 type resourceSecurityGroupRule struct {
 	framework.ResourceWithConfigure
+
+	create   func(context.Context, *resourceSecurityGroupRuleData) (string, error)
+	delete   func(context.Context, *resourceSecurityGroupRuleData) error
+	findByID func(context.Context, string) (*ec2.SecurityGroupRule, error)
 }
 
 // GetSchema returns the schema for this resource.
@@ -191,6 +179,113 @@ func (r *resourceSecurityGroupRule) GetSchema(context.Context) (tfsdk.Schema, di
 	return schema, nil
 }
 
+// Create is called when the provider must create a new resource.
+// Config and planned state values should be read from the CreateRequest and new state values set on the CreateResponse.
+func (r *resourceSecurityGroupRule) Create(ctx context.Context, request resource.CreateRequest, response *resource.CreateResponse) {
+	var data resourceSecurityGroupRuleData
+
+	response.Diagnostics.Append(request.Plan.Get(ctx, &data)...)
+
+	if response.Diagnostics.HasError() {
+		return
+	}
+
+	securityGroupRuleID, err := r.create(ctx, &data)
+
+	if err != nil {
+		response.Diagnostics.AddError("creating VPC Security Group Rule", err.Error())
+
+		return
+	}
+
+	data.ID = types.String{Value: securityGroupRuleID}
+
+	conn := r.Meta().EC2Conn
+	defaultTagsConfig := r.Meta().DefaultTagsConfig
+	ignoreTagsConfig := r.Meta().IgnoreTagsConfig
+	tags := defaultTagsConfig.MergeTags(tftags.New(data.Tags))
+
+	if len(tags) > 0 {
+		if err := UpdateTagsWithContext(ctx, conn, data.ID.Value, nil, tags); err != nil {
+			response.Diagnostics.AddError(fmt.Sprintf("adding VPC Security Group Rule (%s) tags", data.ID.Value), err.Error())
+
+			return
+		}
+	}
+
+	// Set values for unknowns.
+	data.ARN = r.arn(ctx, securityGroupRuleID)
+	data.SecurityGroupRuleID = types.String{Value: securityGroupRuleID}
+	data.TagsAll = flex.FlattenFrameworkStringValueMap(ctx, tags.IgnoreAWS().IgnoreConfig(ignoreTagsConfig).Map())
+
+	response.Diagnostics.Append(response.State.Set(ctx, &data)...)
+}
+
+// Read is called when the provider must read resource values in order to update state.
+// Planned state values should be read from the ReadRequest and new state values set on the ReadResponse.
+func (r *resourceSecurityGroupRule) Read(ctx context.Context, request resource.ReadRequest, response *resource.ReadResponse) {
+	var data resourceSecurityGroupRuleData
+
+	response.Diagnostics.Append(request.State.Get(ctx, &data)...)
+
+	if response.Diagnostics.HasError() {
+		return
+	}
+
+	defaultTagsConfig := r.Meta().DefaultTagsConfig
+	ignoreTagsConfig := r.Meta().IgnoreTagsConfig
+
+	output, err := r.findByID(ctx, data.ID.Value)
+
+	if tfresource.NotFound(err) {
+		tflog.Warn(ctx, "VPC Security Group Rule not found, removing from state", map[string]interface{}{
+			"id": data.ID.Value,
+		})
+		response.State.RemoveResource(ctx)
+
+		return
+	}
+
+	if err != nil {
+		response.Diagnostics.AddError(fmt.Sprintf("reading VPC Security Group Rule (%s)", data.ID.Value), err.Error())
+
+		return
+	}
+
+	data.ARN = r.arn(ctx, data.ID.Value)
+	data.CIDRIPv4 = flex.ToFrameworkStringValue(ctx, output.CidrIpv4)
+	data.CIDRIPv6 = flex.ToFrameworkStringValue(ctx, output.CidrIpv6)
+	data.Description = flex.ToFrameworkStringValue(ctx, output.Description)
+	data.IPProtocol = flex.ToFrameworkStringValue(ctx, output.IpProtocol)
+	data.PrefixListID = flex.ToFrameworkStringValue(ctx, output.PrefixListId)
+	data.ReferencedSecurityGroupID = r.flattenReferencedSecurityGroup(ctx, output.ReferencedGroupInfo)
+	data.SecurityGroupID = flex.ToFrameworkStringValue(ctx, output.GroupId)
+	data.SecurityGroupRuleID = flex.ToFrameworkStringValue(ctx, output.SecurityGroupRuleId)
+
+	// If planned from_port or to_port are null and values of -1 are returned, propagate null.
+	if v := aws.Int64Value(output.FromPort); v == -1 && data.FromPort.IsNull() {
+		data.FromPort = types.Int64{Null: true}
+	} else {
+		data.FromPort = flex.ToFrameworkInt64Value(ctx, output.FromPort)
+	}
+	if v := aws.Int64Value(output.ToPort); v == -1 && data.ToPort.IsNull() {
+		data.ToPort = types.Int64{Null: true}
+	} else {
+		data.ToPort = flex.ToFrameworkInt64Value(ctx, output.ToPort)
+	}
+
+	tags := KeyValueTags(output.Tags).IgnoreAWS().IgnoreConfig(ignoreTagsConfig)
+	// AWS APIs often return empty lists of tags when none have been configured.
+	if tags := tags.RemoveDefaultConfig(defaultTagsConfig).Map(); len(tags) == 0 {
+		data.Tags = tftags.Null
+	} else {
+		data.Tags = flex.FlattenFrameworkStringValueMap(ctx, tags)
+	}
+	data.TagsAll = flex.FlattenFrameworkStringValueMap(ctx, tags.Map())
+
+	response.Diagnostics.Append(response.State.Set(ctx, &data)...)
+}
+
 // Update is called to update the state of the resource.
 // Config, planned state, and prior state values should be read from the UpdateRequest and new state values set on the UpdateResponse.
 func (r *resourceSecurityGroupRule) Update(ctx context.Context, request resource.UpdateRequest, response *resource.UpdateResponse) {
@@ -244,6 +339,36 @@ func (r *resourceSecurityGroupRule) Update(ctx context.Context, request resource
 	}
 
 	response.Diagnostics.Append(response.State.Set(ctx, &new)...)
+}
+
+// Delete is called when the provider must delete the resource.
+// Config values may be read from the DeleteRequest.
+//
+// If execution completes without error, the framework will automatically call DeleteResponse.State.RemoveResource(),
+// so it can be omitted from provider logic.
+func (r *resourceSecurityGroupRule) Delete(ctx context.Context, request resource.DeleteRequest, response *resource.DeleteResponse) {
+	var data resourceSecurityGroupRuleData
+
+	response.Diagnostics.Append(request.State.Get(ctx, &data)...)
+
+	if response.Diagnostics.HasError() {
+		return
+	}
+
+	tflog.Debug(ctx, "deleting VPC Security Group Rule", map[string]interface{}{
+		"id": data.ID.Value,
+	})
+	err := r.delete(ctx, &data)
+
+	if tfawserr.ErrCodeEquals(err, errCodeInvalidGroupNotFound, errCodeInvalidSecurityGroupRuleIdNotFound) {
+		return
+	}
+
+	if err != nil {
+		response.Diagnostics.AddError(fmt.Sprintf("deleting VPC Security Group Rule (%s)", data.ID.Value), err.Error())
+
+		return
+	}
 }
 
 // ImportState is called when the provider must import the state of a resource instance.
@@ -307,134 +432,6 @@ func (r *resourceSecurityGroupRule) ConfigValidators(_ context.Context) []resour
 			path.MatchRoot("referenced_security_group_id"),
 		),
 	}
-}
-
-func (r *resourceSecurityGroupRule) create(ctx context.Context, request resource.CreateRequest, response *resource.CreateResponse, f func(context.Context, *resourceSecurityGroupRuleData) (string, error)) {
-	var data resourceSecurityGroupRuleData
-
-	response.Diagnostics.Append(request.Plan.Get(ctx, &data)...)
-
-	if response.Diagnostics.HasError() {
-		return
-	}
-
-	securityGroupRuleID, err := f(ctx, &data)
-
-	if err != nil {
-		response.Diagnostics.AddError("creating VPC Security Group Rule", err.Error())
-
-		return
-	}
-
-	data.ID = types.String{Value: securityGroupRuleID}
-
-	conn := r.Meta().EC2Conn
-	defaultTagsConfig := r.Meta().DefaultTagsConfig
-	ignoreTagsConfig := r.Meta().IgnoreTagsConfig
-	tags := defaultTagsConfig.MergeTags(tftags.New(data.Tags))
-
-	if len(tags) > 0 {
-		if err := UpdateTagsWithContext(ctx, conn, data.ID.Value, nil, tags); err != nil {
-			response.Diagnostics.AddError(fmt.Sprintf("adding VPC Security Group Rule (%s) tags", data.ID.Value), err.Error())
-
-			return
-		}
-	}
-
-	// Set values for unknowns.
-	data.ARN = r.arn(ctx, securityGroupRuleID)
-	data.SecurityGroupRuleID = types.String{Value: securityGroupRuleID}
-	data.TagsAll = flex.FlattenFrameworkStringValueMap(ctx, tags.IgnoreAWS().IgnoreConfig(ignoreTagsConfig).Map())
-
-	response.Diagnostics.Append(response.State.Set(ctx, &data)...)
-}
-
-func (r *resourceSecurityGroupRule) delete(ctx context.Context, request resource.DeleteRequest, response *resource.DeleteResponse, f func(context.Context, *resourceSecurityGroupRuleData) error) {
-	var data resourceSecurityGroupRuleData
-
-	response.Diagnostics.Append(request.State.Get(ctx, &data)...)
-
-	if response.Diagnostics.HasError() {
-		return
-	}
-
-	tflog.Debug(ctx, "deleting VPC Security Group Rule", map[string]interface{}{
-		"id": data.ID.Value,
-	})
-	err := f(ctx, &data)
-
-	if tfawserr.ErrCodeEquals(err, errCodeInvalidGroupNotFound, errCodeInvalidSecurityGroupRuleIdNotFound) {
-		return
-	}
-
-	if err != nil {
-		response.Diagnostics.AddError(fmt.Sprintf("deleting VPC Security Group Rule (%s)", data.ID.Value), err.Error())
-
-		return
-	}
-}
-
-func (r *resourceSecurityGroupRule) read(ctx context.Context, request resource.ReadRequest, response *resource.ReadResponse, f func(context.Context, string) (*ec2.SecurityGroupRule, error)) {
-	var data resourceSecurityGroupRuleData
-
-	response.Diagnostics.Append(request.State.Get(ctx, &data)...)
-
-	if response.Diagnostics.HasError() {
-		return
-	}
-
-	defaultTagsConfig := r.Meta().DefaultTagsConfig
-	ignoreTagsConfig := r.Meta().IgnoreTagsConfig
-
-	output, err := f(ctx, data.ID.Value)
-
-	if tfresource.NotFound(err) {
-		tflog.Warn(ctx, "VPC Security Group Rule not found, removing from state", map[string]interface{}{
-			"id": data.ID.Value,
-		})
-		response.State.RemoveResource(ctx)
-
-		return
-	}
-
-	if err != nil {
-		response.Diagnostics.AddError(fmt.Sprintf("reading VPC Security Group Rule (%s)", data.ID.Value), err.Error())
-
-		return
-	}
-
-	data.ARN = r.arn(ctx, data.ID.Value)
-	data.CIDRIPv4 = flex.ToFrameworkStringValue(ctx, output.CidrIpv4)
-	data.CIDRIPv6 = flex.ToFrameworkStringValue(ctx, output.CidrIpv6)
-	data.Description = flex.ToFrameworkStringValue(ctx, output.Description)
-	data.IPProtocol = flex.ToFrameworkStringValue(ctx, output.IpProtocol)
-	data.PrefixListID = flex.ToFrameworkStringValue(ctx, output.PrefixListId)
-	data.ReferencedSecurityGroupID = r.flattenReferencedSecurityGroup(ctx, output.ReferencedGroupInfo)
-	data.SecurityGroupID = flex.ToFrameworkStringValue(ctx, output.GroupId)
-	data.SecurityGroupRuleID = flex.ToFrameworkStringValue(ctx, output.SecurityGroupRuleId)
-
-	// If planned from_port or to_port are null and values of -1 are returned, propagate null.
-	if v := aws.Int64Value(output.FromPort); v == -1 && data.FromPort.IsNull() {
-		data.FromPort = types.Int64{Null: true}
-	} else {
-		data.FromPort = flex.ToFrameworkInt64Value(ctx, output.FromPort)
-	}
-	if v := aws.Int64Value(output.ToPort); v == -1 && data.ToPort.IsNull() {
-		data.ToPort = types.Int64{Null: true}
-	} else {
-		data.ToPort = flex.ToFrameworkInt64Value(ctx, output.ToPort)
-	}
-
-	tags := KeyValueTags(output.Tags).IgnoreAWS().IgnoreConfig(ignoreTagsConfig)
-	// AWS APIs often return empty lists of tags when none have been configured.
-	if tags := tags.RemoveDefaultConfig(defaultTagsConfig).Map(); len(tags) == 0 {
-		data.Tags = tftags.Null
-	} else {
-		data.Tags = flex.FlattenFrameworkStringValueMap(ctx, tags)
-	}
-	data.TagsAll = flex.FlattenFrameworkStringValueMap(ctx, tags.Map())
-
-	response.Diagnostics.Append(response.State.Set(ctx, &data)...)
 }
 
 func (r *resourceSecurityGroupRule) arn(_ context.Context, id string) types.String {
